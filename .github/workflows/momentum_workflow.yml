@@ -1,0 +1,81 @@
+name: Scaled NSE Momentum Pipeline
+
+on:
+  schedule:
+    - cron: '30 12 * * 1-5' # Batch 1 @ 6:00 PM IST
+    - cron: '0 13 * * 1-5'  # Batch 2 @ 6:30 PM IST
+    - cron: '30 13 * * 1-5' # Batch 3 @ 7:00 PM IST
+    - cron: '0 14 * * 1-5'  # Batch 4 @ 7:30 PM IST
+    - cron: '30 14 * * 1-5' # Batch 5 @ 8:00 PM IST
+    - cron: '0 15 * * 1-5'  # Batch 6 @ 8:30 PM IST
+    - cron: '30 15 * * 1-5' # Batch 7 @ 9:00 PM IST
+    - cron: '0 16 * * 1-5'  # Batch 8 @ 9:30 PM IST
+    - cron: '30 16 * * 1-5' # Batch 9 @ 10:00 PM IST
+    - cron: '0 17 * * 1-5'  # Batch 10 @ 10:30 PM IST
+    
+    # Intraday Monitor: Every 15 mins during market hours
+    - cron: '*/15 3-10 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: 'Batch number to run (1-10)'
+        required: true
+        default: '1'
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas yfinance requests
+
+      - name: Run Script Based on Time or Dispatch
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          UTC_HOUR=$(date -u +%-H)
+          UTC_MIN=$(date -u +%-M)
+          
+          # Map UTC trigger times to Batch IDs 1-10
+          if [ "\(UTC_HOUR" -eq 12 ] && [ "\)UTC_MIN" -ge 30 ]; then BATCH=1;
+          elif [ "\(UTC_HOUR" -eq 13 ] && [ "\)UTC_MIN" -eq 0 ]; then BATCH=2;
+          elif [ "\(UTC_HOUR" -eq 13 ] && [ "\)UTC_MIN" -ge 30 ]; then BATCH=3;
+          elif [ "\(UTC_HOUR" -eq 14 ] && [ "\)UTC_MIN" -eq 0 ]; then BATCH=4;
+          elif [ "\(UTC_HOUR" -eq 14 ] && [ "\)UTC_MIN" -ge 30 ]; then BATCH=5;
+          elif [ "\(UTC_HOUR" -eq 15 ] && [ "\)UTC_MIN" -eq 0 ]; then BATCH=6;
+          elif [ "\(UTC_HOUR" -eq 15 ] && [ "\)UTC_MIN" -ge 30 ]; then BATCH=7;
+          elif [ "\(UTC_HOUR" -eq 16 ] && [ "\)UTC_MIN" -eq 0 ]; then BATCH=8;
+          elif [ "\(UTC_HOUR" -eq 16 ] && [ "\)UTC_MIN" -ge 30 ]; then BATCH=9;
+          elif [ "\(UTC_HOUR" -eq 17 ] && [ "\)UTC_MIN" -eq 0 ]; then BATCH=10;
+          else BATCH="monitor";
+          fi
+          
+          # Manual override from workflow dispatch
+          if [ "${{ github.event.inputs.batch_id }}" != "" ]; then
+            BATCH="${{ github.event.inputs.batch_id }}"
+          fi
+          
+          echo "Executing target: $BATCH"
+          python momentum_bot.py $BATCH
+
+      - name: Commit and Push Updated Cache Database
+        if: success()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add momentum_cache.db
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update momentum cache DB [skip ci]" && git push)
