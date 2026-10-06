@@ -14,7 +14,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def init_database():
-    """Initializes SQLite database with UPSERT-compatible primary keys."""
+    """Initializes SQLite database with alert tracking state."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -23,14 +23,15 @@ def init_database():
             trigger_price REAL,
             stop_loss REAL,
             target_price REAL,
-            cache_date TEXT
+            cache_date TEXT,
+            alert_sent INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
     conn.close()
 
 def send_telegram_alert(message):
-    """Sends summary or breakout notifications to Telegram."""
+    """Sends breakout notifications to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"\n[Telegram Simulation Alert]:\n{message}\n")
         return
@@ -63,7 +64,6 @@ def get_batch_universe(batch_num):
     batch_size = total_stocks // 10
     
     start_idx = (batch_num - 1) * batch_size
-    # Ensure the 10th batch captures any remainder stocks
     end_idx = total_stocks if batch_num == 10 else batch_num * batch_size
     
     batch_list = full_universe[start_idx:end_idx]
@@ -120,33 +120,31 @@ def run_batch_screener(batch_num):
                     sl = round(trigger * 0.975, 2)
                     tp = round(trigger * 1.06, 2)
                     
-                    # UPSERT: Safe concurrent writes across multiple batches
+                    # UPSERT: Preserves alert_sent status if already triggered today, or resets if new date
                     cursor.execute('''
-                        INSERT OR REPLACE INTO premarket_watchlist (ticker, trigger_price, stop_loss, target_price, cache_date)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (ticker, trigger, sl, tp, today_str))
+                        INSERT INTO premarket_watchlist (ticker, trigger_price, stop_loss, target_price, cache_date, alert_sent)
+                        VALUES (?, ?, ?, ?, ?, COALESCE((SELECT alert_sent FROM premarket_watchlist WHERE ticker = ? AND cache_date = ?), 0))
+                    ''', (ticker, trigger, sl, tp, today_str, ticker, today_str))
                     conn.commit()
                     qualified_count += 1
-                    print(f"✅ Found Setup: {ticker} (Trigger: {trigger})")
                 
                 success = True
             except Exception as e:
-                time.sleep(1) # Brief cooldown on error before retry
+                time.sleep(1)
                 
-        # Politeness delay to prevent Yahoo Finance rate-limiting
         time.sleep(0.5)
 
     conn.close()
-    print(f"Batch {batch_num} complete. Found {qualified_count} setups added/updated in database.")
+    print(f"Batch {batch_num} complete. Found {qualified_count} setups.")
 
 # =========================================================================
-# 15-MINUTE INTRADAY MONITOR
+# 15-MINUTE INTRADAY MONITOR (DEDUPLICATED)
 # =========================================================================
 def run_monitor():
     init_database()
     conn = sqlite3.connect(DB_NAME)
     try:
-        watchlist_df = pd.read_sql_query("SELECT * FROM premarket_watchlist", conn)
+        watchlist_df = pd.read_sql_query("SELECT * FROM premarket_watchlist WHERE alert_sent = 0", conn)
     except Exception as e:
         print(f"⚠️ Database error or missing table: {e}")
         watchlist_df = pd.DataFrame()
@@ -154,11 +152,14 @@ def run_monitor():
         conn.close()
     
     if watchlist_df.empty:
-        print("⚠️ Watchlist cache is empty. No stocks to monitor.")
+        print("⚠️ No pending stocks to monitor (all breakouts already alerted today).")
         return
 
-    print(f"⚡ Checking {len(watchlist_df)} cached stocks on 15m live data...")
+    print(f"⚡ Checking {len(watchlist_df)} pending cached stocks on 15m live data...")
     
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
     for _, row in watchlist_df.iterrows():
         ticker = row['ticker']
         trigger_price = row['trigger_price']
@@ -184,13 +185,19 @@ def run_monitor():
                     f"📊 *Current Price:* INR {latest_close:.2f}"
                 )
                 send_telegram_alert(alert_msg)
-                print(f"✅ Alert sent for {ticker}!")
+                
+                # Mark as alerted so it never spams again today
+                cursor.execute("UPDATE premarket_watchlist SET alert_sent = 1 WHERE ticker = ?", (ticker,))
+                conn.commit()
+                print(f"✅ One-time alert sent and recorded for {ticker}!")
             else:
                 print(f"⏳ {ticker}: Monitoring... (High: INR {latest_high} | Trigger: INR {trigger_price})")
             
-            time.sleep(0.3) # Rate limit protection during intraday checks
+            time.sleep(0.3)
         except Exception as e:
             continue
+
+    conn.close()
 
 # =========================================================================
 # ENTRY POINT
@@ -199,14 +206,12 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if arg.isdigit():
-            # Run specific batch (1 through 10) passed via CLI
             run_batch_screener(int(arg))
         elif arg == "monitor":
             run_monitor()
         else:
-            print("Unknown argument. Use a batch number (1-10) or 'monitor'.")
+            print("Unknown argument.")
     else:
-        # Fallback auto-detection for monitor vs evening batches if needed
         IST = timezone(timedelta(hours=5, minutes=30))
         now_ist = datetime.now(IST)
         if 9 <= now_ist.hour < 16:
